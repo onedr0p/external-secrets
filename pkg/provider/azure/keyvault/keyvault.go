@@ -33,6 +33,7 @@ import (
 	"github.com/Azure/go-autorest/autorest/adal"
 	kvauth "github.com/Azure/go-autorest/autorest/azure/auth"
 	"github.com/AzureAD/microsoft-authentication-library-for-go/apps/confidential"
+	"github.com/lestrrat-go/jwx/jwk"
 	"github.com/tidwall/gjson"
 	authv1 "k8s.io/api/authentication/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
 	kcorev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	ctrlcfg "sigs.k8s.io/controller-runtime/pkg/client/config"
 	"software.sslmate.com/src/go-pkcs12"
@@ -96,7 +98,7 @@ type SecretClient interface {
 	GetSecretsComplete(ctx context.Context, vaultBaseURL string, maxresults *int32) (result keyvault.SecretListResultIterator, err error)
 	GetCertificate(ctx context.Context, vaultBaseURL string, certificateName string, certificateVersion string) (result keyvault.CertificateBundle, err error)
 	SetSecret(ctx context.Context, vaultBaseURL string, secretName string, parameters keyvault.SecretSetParameters) (result keyvault.SecretBundle, err error)
-	CreateKey(ctx context.Context, vaultBaseURL string, keyName string, parameters keyvault.KeyCreateParameters) (result keyvault.KeyBundle, err error)
+	ImportKey(ctx context.Context, vaultBaseURL string, keyName string, parameters keyvault.KeyImportParameters) (result keyvault.KeyBundle, err error)
 	ImportCertificate(ctx context.Context, vaultBaseURL string, certificateName string, parameters keyvault.CertificateImportParameters) (result keyvault.CertificateBundle, err error)
 }
 
@@ -221,6 +223,20 @@ func getCertificateFromValue(value []byte) (*x509.Certificate, error) {
 	return localCert, err
 }
 
+func getKeyFromValue(value []byte) (interface{}, error) {
+	var val []byte
+	val = value
+	pemBlock, _ := pem.Decode(value)
+	if pemBlock != nil {
+		val = pemBlock.Bytes
+	}
+	pri, err := x509.ParsePKCS1PrivateKey(val)
+	if err != nil {
+		return nil, fmt.Errorf("failed converting RSA key (only supported key right now): %v", err)
+	}
+	return pri, nil
+}
+
 // Not Implemented SetSecret.
 func (a *Azure) SetSecret(ctx context.Context, value []byte, ref esv1beta1.PushRemoteRef) error {
 	objectType, secretName := getObjType(esv1beta1.ExternalSecretDataRemoteRef{Key: ref.GetRemoteKey()})
@@ -280,9 +296,50 @@ func (a *Azure) SetSecret(ctx context.Context, value []byte, ref esv1beta1.PushR
 			return fmt.Errorf("could not import certificate %v: %v", secretName, err)
 		}
 	case objectTypeKey:
-		// returns a KeyBundle that contains a jwk
-		// azure kv returns only public keys
-		// see: https://pkg.go.dev/github.com/Azure/azure-sdk-for-go/services/keyvault/v7.0/keyvault#KeyBundle
+		key, err := getKeyFromValue(value)
+		if err != nil {
+			return fmt.Errorf("could not load private key %v: %v", secretName, err)
+		}
+		jwKey, err := jwk.New(key)
+		if err != nil {
+			return fmt.Errorf("figure out: %v", err)
+		}
+		buf, err := json.MarshalIndent(jwKey, "", "  ")
+		if err != nil {
+			return fmt.Errorf("figure out marshal:%v", err)
+		}
+		azkey := keyvault.JSONWebKey{}
+		err = json.Unmarshal(buf, &azkey)
+		if err != nil {
+			return fmt.Errorf("figure out unmarshal:%v", err)
+		}
+		keyFromVault, err := a.baseClient.GetKey(ctx, *a.provider.VaultURL, secretName, "")
+		if err != nil && err.(autorest.DetailedError).StatusCode != 404 {
+			return fmt.Errorf("could not check if key %v already exists: %v", secretName, err)
+		}
+		if err == nil {
+			t, ok := keyFromVault.Tags["managed-by"]
+			if !ok || t != pointer.StringPtr("external-secrets") {
+				return fmt.Errorf("key not managed by external-secrets")
+			}
+			if &azkey.K == &keyFromVault.Key.K {
+				return nil
+			}
+		}
+
+		params := keyvault.KeyImportParameters{
+			Key: &azkey,
+			Tags: map[string]*string{
+				"managed-by": pointer.StringPtr("external-secrets"),
+			},
+		}
+		resp, err := a.baseClient.ImportKey(ctx, *a.provider.VaultURL, secretName, params)
+		if err != nil {
+			return fmt.Errorf("could not import key from secret %v: %v", secretName, err)
+		}
+		if resp.Key == nil {
+			return fmt.Errorf("oops")
+		}
 	}
 
 	return nil
